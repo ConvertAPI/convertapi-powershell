@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pwsh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: PowerShell version
+        run: pwsh -c '$PSVersionTable | Format-List *'
+
+      - name: Install PSScriptAnalyzer
+        run: pwsh -c 'Install-Module PSScriptAnalyzer -Scope CurrentUser -Force'
+
+      - name: Lint module
+        run: pwsh -c 'Invoke-ScriptAnalyzer -Path ./ConvertApi -Recurse -Severity Warning -ReportSummary'
+
+      - name: Import test
+        run: pwsh -c 'Import-Module ./ConvertApi/ConvertApi.psd1 -Force; (Get-Command Invoke-ConvertApi).Name; Get-Help Invoke-ConvertApi -ErrorAction SilentlyContinue | Out-Null'

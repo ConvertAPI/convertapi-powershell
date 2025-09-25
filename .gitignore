@@ -1,0 +1,16 @@
+# editors & OS
+.vscode/
+.idea/
+.DS_Store
+
+# build/output/temp
+out/
+dist/
+bin/
+obj/
+*.nupkg
+*.log
+
+# never commit secrets
+*.secret
+*.env
