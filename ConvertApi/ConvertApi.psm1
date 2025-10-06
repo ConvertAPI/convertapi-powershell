@@ -60,6 +60,13 @@ Converts (or merges) files via ConvertAPI v2 REST, supporting multiple files/URL
 - Single URL => passes ?Url=... as a query parameter.
 - Extra API params via -Parameters.
 - Use -StoreFile to get time-limited URLs for downloading.
+- File-typed parameters: any -Parameters key that ends with 'File' is treated as a file input
+  when its value is a local path; triggers multipart automatically.
+
+- Use -InputMode to control how inputs are sent:
+  * Auto  (default): 1 input -> single-file; 2+ inputs -> Files[i] multipart
+  * File               force single-file (exactly 1 input required)
+  * Files              force Files[i] multipart (even for 1 input)
 
 .EXAMPLE
 Invoke-ConvertApi -From pdf -To merge -File .\a.pdf, .\b.pdf -OutputPath .\out -StoreFile
@@ -86,7 +93,9 @@ https://www.convertapi.com/a/authentication
     [string]$Token,              # overrides env/module token
     [int]$TimeoutSec = 300,
     [switch]$Overwrite,
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    [ValidateSet('Auto','File','Files')] [string]$InputMode = 'Auto'
   )
 
   begin {
@@ -146,7 +155,7 @@ https://www.convertapi.com/a/authentication
       $streams = @()
 
       try {
-        # Add files
+        # Add file parts
         foreach ($kv in $FilesTable.GetEnumerator()){
           $path = $kv.Value
           $stream = [System.IO.File]::OpenRead($path)
@@ -158,12 +167,10 @@ https://www.convertapi.com/a/authentication
           $content.Add($sc)
         }
 
-        # Add URLs as string fields (Files[i] = 'https://...')
+        # Add extra "string" parts (includes Files[i] urls, Url, StoreFile, Parameters, etc.)
         foreach ($kv in $UrlsTable.GetEnumerator()){
-          $content.Add([System.Net.Http.StringContent]::new($kv.Value), $kv.Key)
+          $content.Add([System.Net.Http.StringContent]::new([string]$kv.Value), $kv.Key)
         }
-
-        # Add extra fields (StoreFile, Parameters...)
         foreach ($kv in $Fields.GetEnumerator()){
           $content.Add([System.Net.Http.StringContent]::new([string]$kv.Value), $kv.Key)
         }
@@ -186,66 +193,117 @@ https://www.convertapi.com/a/authentication
       }
     }
 
-    # Common query/form params
+    # Common query/form params (cloned later for multipart)
     $common = @{}
     if ($StoreFile.IsPresent) { $common["StoreFile"] = "true" }
     if ($Parameters) { foreach ($k in $Parameters.Keys) { $common[$k] = $Parameters[$k] } }
   }
 
   process {
-    $fileCount = @($File).Count
-    $urlCount  = @($Url).Count
-    if ($fileCount -eq 0 -and $urlCount -eq 0) {
-      throw "Provide at least one -File or -Url."
+    # Safe counts (avoid @($null).Count = 1)
+    $fileCount  = if ($PSBoundParameters.ContainsKey('File') -and $null -ne $File) { $File.Count } else { 0 }
+    $urlCount   = if ($PSBoundParameters.ContainsKey('Url')  -and $null -ne $Url)  { $Url.Count  } else { 0 }
+    $inputTotal = $fileCount + $urlCount
+    if ($inputTotal -lt 1 -and -not $Parameters) { throw "Provide at least one -File or -Url." }
+
+    # Detect extra file-typed parameters (keys ending with 'File')
+    $fileParamKeys = @()
+    if ($Parameters) {
+      foreach ($k in $Parameters.Keys) {
+        if ($k -match '(?i)File$') { $fileParamKeys += $k }
+      }
     }
 
-    # MULTI-INPUT (merge etc.) via HttpClient multipart  —— PS 5.1 safe
-    if ($fileCount + $urlCount -gt 1) {
-      $uri  = New-ConvertApiUri -From $From -To $To -Parms $null
+    # Decide how to send primary inputs
+    $useFilesArray = switch ($InputMode) {
+      'Files' { $true }                                          # force Files[i]
+      'File'  { if ($inputTotal -ne 1) { throw "InputMode 'File' requires exactly one input, but $inputTotal were provided." }; $false }
+      default { $inputTotal -ge 2 }                              # Auto: Files[i] only when 2+ inputs
+    }
 
-      # Build Files[i] in order
+    # Using multipart: we either use Files[i] OR we have any File-typed parameters
+    $needsMultipart = $useFilesArray -or ($fileParamKeys.Count -gt 0)
+
+    if ($needsMultipart) {
+      $uri        = New-ConvertApiUri -From $From -To $To -Parms $null
       $filesTable = [ordered]@{}
-      $urlsTable  = [ordered]@{}
-      $i = 0
-      foreach ($p in $File) {
-        if (-not (Test-Path $p)) { throw "Input not found: $p" }
-        $resolved = (Resolve-Path $p).Path
-        $filesTable["Files[$i]"] = $resolved
-        $i++
-      }
-      foreach ($u in $Url) {
-        $urlsTable["Files[$i]"] = $u
-        $i++
+      $stringParts = [ordered]@{}   # Url, Files[i] urls, StoreFile, other non-file params
+
+      # Primary inputs
+      if ($useFilesArray) {
+        # Files[i] … for local files
+        $i = 0
+        foreach ($p in ($File | Where-Object { $_ })) {
+          if (-not (Test-Path $p)) { throw "Input not found: $p" }
+          $filesTable["Files[$i]"] = (Resolve-Path $p).Path
+          $i++
+        }
+        # Files[i] … for url inputs (as strings)
+        foreach ($u in ($Url | Where-Object { $_ })) {
+          $stringParts["Files[$i]"] = $u
+          $i++
+        }
+      } else {
+        # Single primary input carried as 'File' or 'Url' in multipart
+        if ($fileCount -eq 1 -and $urlCount -eq 0) {
+          if (-not (Test-Path $File[0])) { throw "Input not found: $($File[0])" }
+          $filesTable["File"] = (Resolve-Path $File[0]).Path
+        } elseif ($urlCount -eq 1 -and $fileCount -eq 0) {
+          $stringParts["Url"] = $Url[0]
+        }
       }
 
-      # Extra fields
+      # Add file-typed parameters (…File). If value is a local path -> file part; otherwise send as string
+      if ($fileParamKeys.Count -gt 0) {
+        foreach ($k in $fileParamKeys) {
+          $v = $Parameters[$k]
+          $vals = @()
+          if ($v -is [System.Collections.IEnumerable] -and -not ($v -is [string])) { $vals = @($v) } else { $vals = @($v) }
+          $idx = 0
+          foreach ($item in $vals) {
+            if ($item -and (Test-Path $item)) {
+              $partName = if ($idx -eq 0) { $k } else { "$k[$idx]" }
+              $filesTable[$partName] = (Resolve-Path $item).Path
+              $idx++
+            } else {
+              # URL or plain string → send as string field
+              $partName = if ($idx -eq 0) { $k } else { "$k[$idx]" }
+              $stringParts[$partName] = [string]$item
+              $idx++
+            }
+          }
+        }
+      }
+
+      # Add remaining simple fields (Parameters + StoreFile) except the ones we already promoted to file/string parts above
       $fields = [ordered]@{}
       foreach ($k in $common.Keys) {
+        if ($fileParamKeys -contains $k) { continue }  # skip; already added as file/string parts
         $v = $common[$k]; if ($v -is [bool]) { $v = $v.ToString().ToLower() }
         $fields[$k] = [string]$v
       }
 
-      $label = ("{0} item(s)" -f ($fileCount + $urlCount))
+      $label = ("{0} item(s)" -f [Math]::Max($inputTotal,1))
       if ($PSCmdlet.ShouldProcess($label, "Convert $From -> $To (multipart)")) {
-        $response = Invoke-ConvertApiMultipart -Uri $uri -FilesTable $filesTable -UrlsTable $urlsTable -Fields $fields -Token $Token -TimeoutSec $TimeoutSec
+        $response = Invoke-ConvertApiMultipart -Uri $uri -FilesTable $filesTable -UrlsTable $stringParts -Fields $fields -Token $Token -TimeoutSec $TimeoutSec
         Save-ConvertApiFiles $response
       }
       return
     }
 
-    # SINGLE URL
+    # ---- Single URL (query string) ----
     if ($urlCount -eq 1 -and $fileCount -eq 0) {
       $q = $common.Clone(); $q["Url"] = $Url[0]
       $uri = New-ConvertApiUri -From $From -To $To -Parms $q
-      if ($PSCmdlet.ShouldProcess($Url[0], "Convert $From -> $To (url)")) {
+      if ($PSCmdlet.ShouldProcess($Url[0], "Convert $From -> $To (single url)")) {
         $response = Invoke-RestMethod -Uri $uri -Method POST -Headers $headers -TimeoutSec $TimeoutSec
         Save-ConvertApiFiles $response
       }
       return
     }
 
-    # SINGLE LOCAL FILE (octet-stream)
-    if ($fileCount -eq 1) {
+    # ---- Single local file (octet-stream + Content-Disposition) ----
+    if ($fileCount -eq 1 -and $urlCount -eq 0) {
       $resolved = (Resolve-Path $File[0]).Path
       $name     = [IO.Path]::GetFileName($resolved)
       $bytes    = [IO.File]::ReadAllBytes($resolved)
@@ -261,6 +319,8 @@ https://www.convertapi.com/a/authentication
       }
       return
     }
+
+    throw "Cannot resolve inputs for the chosen InputMode '$InputMode'."
   }
 }
 
