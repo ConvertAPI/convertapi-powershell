@@ -1,7 +1,7 @@
 # ConvertApi (PowerShell)
 
 Thin PowerShell wrapper for the ConvertAPI v2 REST endpoints.  
-Supports **single-file conversions**, **URL-based conversions**, and **multi-file merges** (e.g., PDF → merge) with safe downloads.
+Supports **single-file conversions**, **URL-based conversions**, and **multi-file multi-part uploads** (e.g., PDF → merge) with safe downloads.
 
 > **Get your API token:** https://www.convertapi.com/a/authentication
 
@@ -12,9 +12,10 @@ Supports **single-file conversions**, **URL-based conversions**, and **multi-fil
 - 🔐 Token-based auth via `CONVERTAPI_API_TOKEN` or `Set-ConvertApiToken`
 - 📄 Single local file upload (raw bytes, `Content-Disposition`)
 - 🌐 Single URL conversion (query param `Url=…`)
-- 📦 Multi-input **multipart/form-data** for merges: `Files[0]`, `Files[1]`, …
+- 📦 Multi-input **multipart/form-data** (`Files[0]`, `Files[1]`, …) when you pass multiple inputs
+- 📎 **Extra file parameters**: any parameter whose name ends with `File` (e.g., `OverlayFile`, `BackgroundFile`) is detected and uploaded as a file part automatically
 - ⚙️ Extra options via `-Parameters @{ Name = 'Value' }`
-- 💾 Saves results to disk; preserves API-provided filenames
+- 💾 Saves results to disk; preserves API‑provided filenames
 - 🧪 `-WhatIf`/`-Confirm` safety (SupportsShouldProcess)
 - 🖥 Works on Windows PowerShell 5.1 and PowerShell 7+
 
@@ -22,6 +23,17 @@ Supports **single-file conversions**, **URL-based conversions**, and **multi-fil
 
 ## Install
 
+### Option A — PowerShell Gallery (recommended)
+Once published to the Gallery, end users can install with:
+```powershell
+Install-Module ConvertApi -Scope CurrentUser
+Import-Module ConvertApi -Force
+# later updates
+Update-Module ConvertApi
+```
+> Notes: First-time installs may prompt to trust the PSGallery repo and to install the NuGet provider—this is normal.
+
+### Option B — Manual install from source
 Place the folder:
 
 ```
@@ -36,10 +48,16 @@ into your user modules path:
 - PowerShell 7+ → `~/Documents/PowerShell/Modules/ConvertApi`
 
 Then:
-
 ```powershell
 Import-Module ConvertApi -Force
 ```
+
+> If you downloaded a ZIP in a browser, Windows may mark files as “downloaded from internet.”  
+> Run once to unblock (not needed when installing via **PowerShell Gallery** or **git clone**):
+> ```powershell
+> Set-ExecutionPolicy -Scope Process Bypass -Force
+> Unblock-File -Path '<repo>\*' -Recurse
+> ```
 
 ---
 
@@ -119,7 +137,29 @@ Invoke-ConvertApi -From pdf -To merge `
   -OutputPath .\out -StoreFile
 ```
 
-> The module automatically switches to **multipart/form-data** with `Files[0]`, `Files[1]`, … when it detects multiple inputs (files and/or URLs).
+> When you pass multiple inputs (files and/or URLs), the module automatically uses **multipart/form‑data** and sends them as `Files[0]`, `Files[1]`, …
+
+---
+
+## Watermark / Overlay (extra file parameter)
+
+Some converters accept **additional files** as parameters. Any parameter whose name ends with `File` is treated as a file part when the value is a local path.
+
+**PDF → watermark-overlay (overlay from local PDF):**
+```powershell
+Invoke-ConvertApi -From pdf -To watermark-overlay `
+  -File .\a.pdf `
+  -Parameters @{ OverlayFile = '.\b.pdf'; Opacity = 0.6 } `
+  -OutputPath .\out -StoreFile -Verbose
+```
+
+**Overlay from a URL:**
+```powershell
+Invoke-ConvertApi -From pdf -To watermark-overlay `
+  -File .\a.pdf `
+  -Parameters @{ OverlayFile = 'https://example.com/b.pdf' } `
+  -OutputPath .\out -StoreFile
+```
 
 ---
 
@@ -130,7 +170,7 @@ Invoke-ConvertApi -From pdf -To merge `
 
 - `-File` `[string[]]`  
   One or more local files.  
-  - **1 file** → raw bytes upload (octet-stream + Content-Disposition)  
+  - **1 file** → raw bytes upload (octet‑stream + Content‑Disposition)  
   - **2+ files** → multipart form with `Files[i]`
 
 - `-Url` `[string[]]`  
@@ -139,7 +179,8 @@ Invoke-ConvertApi -From pdf -To merge `
   - **2+ URLs** → multipart form with `Files[i]`
 
 - `-Parameters` `[hashtable]`  
-  Additional API options (become query params or form fields, as appropriate).
+  Additional API options (become query params or form fields).  
+  **Special rule:** keys that end with **`File`** and point to a local path are uploaded as **file parts**; URL strings remain as string fields.
 
 - `-StoreFile` `[switch]`  
   Adds `StoreFile=true` so the API returns downloadable URLs.
@@ -165,8 +206,22 @@ Invoke-ConvertApi -From pdf -To merge `
   ```
   Token portal: https://www.convertapi.com/a/authentication
 
-- **“Input not found”**  
-  Verify paths or use full paths. On merges, any missing file will halt the request.
+- **Execution policy / blocked scripts**  
+  Not an issue when installing via **PowerShell Gallery** or **git clone**.  
+  Only needed for ZIP downloads from the browser:
+  ```powershell
+  Set-ExecutionPolicy -Scope Process Bypass -Force
+  Unblock-File -Path '<repo>\*' -Recurse
+  ```
+
+- **AllSigned environments**  
+  Your org may require Authenticode‑signed scripts. Sign the module or ask your admin to trust your code‑signing certificate.
+
+- **Launching a new process with multiple `-File` values**  
+  Repeat the flag:
+  ```powershell
+  pwsh -NoProfile -File .\examples\Convert-PdfToMerge.ps1 -File .\a.pdf -File .\b.pdf -OutDir .\out
+  ```
 
 - **Filename collisions**  
   If a target file exists and `-Overwrite` is not set, the module appends a random suffix.
@@ -180,18 +235,21 @@ Invoke-ConvertApi -From pdf -To merge `
 
 Choose a license appropriate for your distribution (e.g., MIT).
 
-
 ---
 
 ## Examples
 
-- `examples/Merge-Pdf.ps1` – Merge multiple PDFs (local files and/or URLs).
+- `examples/Convert-PdfToMerge.ps1` – Merge multiple PDFs (local files and/or URLs).
 - `examples/Convert-DocxToPdf.ps1` – Batch DOCX → PDF for a folder.
+- `examples/Watermark-Overlay.ps1` – Apply a PDF overlay using `OverlayFile`.
 
 Run with:
 ```powershell
-pwsh examples/Merge-Pdf.ps1 -File .\a.pdf,.\b.pdf -OutDir .\out -StoreFile
-pwsh examples/Convert-DocxToPdf.ps1 -InDir .\docs -OutDir .\out -Recurse
+# PowerShell 7
+pwsh .\examples\Convert-PdfToMerge.ps1 -File .\a.pdf,.\b.pdf -OutDir .\out -StoreFile
+
+# Windows PowerShell 5.1
+powershell -File .\examples\Convert-DocxToPdf.ps1 -InDir .\docs -OutDir .\out -Recurse
 ```
 
 ---
